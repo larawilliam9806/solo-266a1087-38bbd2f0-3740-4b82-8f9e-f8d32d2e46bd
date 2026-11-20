@@ -75,6 +75,23 @@ CREATE TABLE IF NOT EXISTS analysis_gaps (
     end_time    TEXT NOT NULL,
     reason      TEXT NOT NULL   -- out_of_range | disconnected
 );
+
+-- 逐采样点匹配明细:车距复核的依据,与分析在同一事务写入。
+-- 缺口内未匹配点同样落一行(segment_id/offset_m/snap_dist_m 为 NULL),
+-- 因此可凭该表是否存在判断旧分析能否复核。
+CREATE TABLE IF NOT EXISTS analysis_point_matches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id INTEGER NOT NULL REFERENCES analyses(id),
+    seq         INTEGER NOT NULL,
+    ts          TEXT NOT NULL,             -- UTC ISO8601,采样时刻
+    segment_id  TEXT,                      -- 匹配到的有向路段编号;未匹配为 NULL
+    offset_m    REAL,                      -- 吸附点距所在路段起点的里程(米)
+    snap_dist_m REAL,                      -- GPS 点到吸附点的距离(米)
+    UNIQUE (analysis_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_apm_analysis
+    ON analysis_point_matches(analysis_id, seq);
 """
 
 

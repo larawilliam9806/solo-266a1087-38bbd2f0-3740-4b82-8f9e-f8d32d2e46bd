@@ -6,9 +6,12 @@
   GET  /api/networks/{v}      查看某版本路网(含路段)
   POST /api/trajectories      提交轨迹(UTC 时刻 + 坐标)
   GET  /api/trajectories/{id} 查看轨迹
-  POST /api/match             在指定路网版本上执行匹配,生成连续路径与缺口
+  POST /api/match             在指定路网版本上执行匹配,生成连续路径与缺口,
+                              并在同一事务写入逐采样点复核明细
   GET  /api/analyses          按路网版本 / 轨迹查询历史分析
-  GET  /            /api/analyses/{id} 查看分析结果(匹配路段、进入/离开时刻、里程、缺口原因)
+  GET  /api/analyses/{id}     查看分析结果(has_review_detail 标记可否复核)
+  POST /api/distance-reviews  车距复核:读取两个分析的已存明细,
+                              找出同一路段上车距不超过阈值的持续时段
 """
 from __future__ import annotations
 
@@ -18,7 +21,9 @@ from fastapi import FastAPI, HTTPException, Query
 
 from . import db
 from .matcher import NetworkIndex, Segment, TrackPoint
-from .schemas import MatchRequest, NetworkCreate, TrajectoryCreate
+from .review import Gap, PointMatch, review_distance, serialize_periods
+from .schemas import (DistanceReviewRequest, MatchRequest, NetworkCreate,
+                      TrajectoryCreate)
 from .util import fmt_ts, parse_ts, utcnow
 
 
@@ -184,29 +189,38 @@ def run_match(body: MatchRequest):
     now = fmt_ts(utcnow())
     conn = db.connect()
     try:
-        cur = conn.execute(
-            "INSERT INTO analyses (trajectory_id, network_id, created_at, total_points, "
-            "matched_points, total_distance_m) VALUES (?, ?, ?, ?, ?, ?)",
-            (traj["id"], net["id"], now, result["total_points"],
-             result["matched_points"], result["total_distance_m"]),
-        )
-        aid = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO analysis_segments (analysis_id, seq, segment_id, enter_time, "
-            "leave_time, distance_m) VALUES (?, ?, ?, ?, ?, ?)",
-            [(aid, p["seq"], p["segment_id"], p["enter_time"], p["leave_time"], p["distance_m"])
-             for p in result["path"]],
-        )
-        conn.executemany(
-            "INSERT INTO analysis_gaps (analysis_id, seq, start_time, end_time, reason) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [(aid, g["seq"], g["start_time"], g["end_time"], g["reason"])
-             for g in result["gaps"]],
-        )
-        conn.commit()
+        # 分析与复核所需的逐点明细在同一事务写入;任一写入失败整体回滚,不生成本次分析
+        with conn:  # 正常结束自动 commit,抛异常自动 rollback
+            cur = conn.execute(
+                "INSERT INTO analyses (trajectory_id, network_id, created_at, total_points, "
+                "matched_points, total_distance_m) VALUES (?, ?, ?, ?, ?, ?)",
+                (traj["id"], net["id"], now, result["total_points"],
+                 result["matched_points"], result["total_distance_m"]),
+            )
+            aid = cur.lastrowid
+            conn.executemany(
+                "INSERT INTO analysis_segments (analysis_id, seq, segment_id, enter_time, "
+                "leave_time, distance_m) VALUES (?, ?, ?, ?, ?, ?)",
+                [(aid, p["seq"], p["segment_id"], p["enter_time"], p["leave_time"], p["distance_m"])
+                 for p in result["path"]],
+            )
+            conn.executemany(
+                "INSERT INTO analysis_gaps (analysis_id, seq, start_time, end_time, reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(aid, g["seq"], g["start_time"], g["end_time"], g["reason"])
+                 for g in result["gaps"]],
+            )
+            conn.executemany(
+                "INSERT INTO analysis_point_matches (analysis_id, seq, ts, segment_id, "
+                "offset_m, snap_dist_m) VALUES (?, ?, ?, ?, ?, ?)",
+                [(aid, m["seq"], m["ts"], m["segment_id"], m["offset_m"], m["snap_dist_m"])
+                 for m in result["point_matches"]],
+            )
     finally:
         conn.close()
 
+    # 复核明细仅用于复核读取,不放进匹配响应,保持原响应结构不变
+    result = {k: v for k, v in result.items() if k != "point_matches"}
     return {"analysis_id": aid, "trajectory_id": traj["id"],
             "network_version": net["version"], "created_at": now, **result}
 
@@ -254,14 +268,79 @@ def get_analysis(analysis_id: int):
             "SELECT seq, start_time, end_time, reason "
             "FROM analysis_gaps WHERE analysis_id = ? ORDER BY seq", (analysis_id,)
         ).fetchall()
+        has_detail = conn.execute(
+            "SELECT 1 FROM analysis_point_matches WHERE analysis_id = ? LIMIT 1",
+            (analysis_id,),
+        ).fetchone() is not None
         return {"analysis_id": a["id"], "trajectory_id": a["trajectory_id"],
                 "network_version": a["network_version"], "created_at": a["created_at"],
                 "total_points": a["total_points"], "matched_points": a["matched_points"],
                 "total_distance_m": a["total_distance_m"],
+                "has_review_detail": has_detail,
                 "path": [dict(s) for s in segs],
                 "gaps": [dict(g) for g in gaps]}
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------------ 车距复核
+def _load_review_inputs(conn, analysis_id: int) -> tuple[dict, list[PointMatch], list[Gap]]:
+    """读取一次分析的复核依据;分析不存在抛 404,缺少复核明细抛 409(提示重新匹配)。"""
+    a = conn.execute(
+        "SELECT a.*, n.version AS network_version FROM analyses a "
+        "JOIN networks n ON n.id = a.network_id WHERE a.id = ?", (analysis_id,)
+    ).fetchone()
+    if not a:
+        raise HTTPException(404, f"分析 {analysis_id} 不存在")
+    rows = conn.execute(
+        "SELECT seq, ts, segment_id, offset_m FROM analysis_point_matches "
+        "WHERE analysis_id = ? ORDER BY seq", (analysis_id,)
+    ).fetchall()
+    if not rows:
+        # 旧分析在明细表上线前生成,缺少复核依据
+        raise HTTPException(
+            409, f"分析 {analysis_id} 缺少车距复核所需的逐点匹配明细,"
+                 "请在当前路网版本上重新匹配后再发起复核")
+    matches = [PointMatch(seq=r["seq"], ts=parse_ts(r["ts"]),
+                          segment_id=r["segment_id"], offset_m=r["offset_m"]) for r in rows]
+    gap_rows = conn.execute(
+        "SELECT start_time, end_time FROM analysis_gaps WHERE analysis_id = ? ORDER BY seq",
+        (analysis_id,),
+    ).fetchall()
+    gaps = [Gap(parse_ts(g["start_time"]), parse_ts(g["end_time"])) for g in gap_rows]
+    return dict(a), matches, gaps
+
+
+@app.post("/api/distance-reviews", status_code=200)
+def distance_review(body: DistanceReviewRequest):
+    """车距复核:回放两个分析的已存明细,找出同路段跟车过近的时段。
+
+    两个分析必须属于同一路网版本、不同轨迹;复核只读取落库明细,不重新匹配。
+    返回车距不超过阈值且持续时间大于零的各段起止 UTC 时刻、路段号与最小车距;
+    没有符合条件的时段返回空列表。
+    """
+    conn = db.connect()
+    try:
+        meta_a, matches_a, gaps_a = _load_review_inputs(conn, body.analysis_id_a)
+        meta_b, matches_b, gaps_b = _load_review_inputs(conn, body.analysis_id_b)
+    finally:
+        conn.close()
+
+    if meta_a["network_id"] != meta_b["network_id"]:
+        raise HTTPException(
+            409, f"两个分析的路网版本不一致('{meta_a['network_version']}' vs "
+                 f"'{meta_b['network_version']}');车距复核要求同一路网版本")
+    if meta_a["trajectory_id"] == meta_b["trajectory_id"]:
+        raise HTTPException(409, "两个分析属于同一条轨迹;车距复核要求分属不同轨迹的两个分析号")
+
+    periods = review_distance(matches_a, gaps_a, matches_b, gaps_b, body.threshold_m)
+    return {
+        "analysis_id_a": body.analysis_id_a,
+        "analysis_id_b": body.analysis_id_b,
+        "network_version": meta_a["network_version"],
+        "threshold_m": body.threshold_m,
+        "periods": serialize_periods(periods),
+    }
 
 
 @app.get("/health")

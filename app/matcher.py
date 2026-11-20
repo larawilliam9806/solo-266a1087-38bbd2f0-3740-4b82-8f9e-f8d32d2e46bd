@@ -261,10 +261,21 @@ class NetworkIndex:
             self._match_run(points, list(range(i, j + 1)), cands, pieces)
             i = j + 1
 
-        # 2) 展开为连续路径
+        # 2) 展开为连续路径,并逐采样点记录匹配明细(车距复核的依据,随分析一起落库)
         visits: list[tuple] = []
         ranges: list[tuple[int, int]] = []
+        point_matches: list[dict | None] = [None] * n
         for idxs, path in pieces:
+            chosen = [cands[i][p] for i, p in zip(idxs, path)]
+            for k, i in enumerate(idxs):
+                c = chosen[k]
+                point_matches[i] = {
+                    "seq": i,
+                    "ts": fmt_ts(points[i].ts),
+                    "segment_id": self.segments[c.seg_idx].segment_id,
+                    "offset_m": round(c.offset_m, 3),
+                    "snap_dist_m": round(c.dist_m, 3),
+                }
             v = self._build_visits(points, idxs, path, cands)
             if v:
                 visits.extend(v)
@@ -308,4 +319,9 @@ class NetworkIndex:
             "total_distance_m": round(sum(v[3] for v in visits), 3),
             "path": path_json,
             "gaps": gaps,
+            # 逐采样点匹配明细:未匹配点(缺口内)为 None;与分析同事务落库,供车距复核直接读取
+            "point_matches": [m if m is not None else {"seq": k, "ts": fmt_ts(points[k].ts),
+                                                        "segment_id": None, "offset_m": None,
+                                                        "snap_dist_m": None}
+                              for k, m in enumerate(point_matches)],
         }

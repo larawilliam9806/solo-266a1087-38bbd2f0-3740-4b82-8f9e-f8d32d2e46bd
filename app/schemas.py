@@ -49,3 +49,18 @@ class TrajectoryCreate(BaseModel):
 class MatchRequest(BaseModel):
     trajectory_id: int
     network_version: str = Field(min_length=1, description="指定匹配使用的路网版本;一次分析只使用该版本快照")
+
+
+class DistanceReviewRequest(BaseModel):
+    """车距复核请求:同一路网版本下、分属两条不同轨迹的两个分析号 + 正数车距阈值(米)。"""
+    analysis_id_a: int = Field(gt=0, description="第一个分析号(分析号即匹配分析的编号)")
+    analysis_id_b: int = Field(gt=0, description="第二个分析号,必须与 analysis_id_a 不同")
+    threshold_m: float = Field(gt=0, description="车距阈值(米),必须为正数")
+
+    @field_validator("analysis_id_b")
+    @classmethod
+    def distinct_analyses(cls, v: int, info) -> int:
+        other = info.data.get("analysis_id_a")
+        if other is not None and v == other:
+            raise ValueError("两个分析号必须不同(需要属于不同轨迹的两次分析)")
+        return v
